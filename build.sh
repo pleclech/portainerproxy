@@ -268,7 +268,7 @@ if [ "$image" == "true" ]; then
             continue
 	    fi
 
-        image="${user}/portproxy:${version}-${os}-${arch}"
+        image="ghcr.io/${user}/portproxy:${version}-${os}-${arch}"
         
         info "Building image for ${image}"
         declare -a options=()
