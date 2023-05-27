@@ -1,0 +1,21 @@
+{
+  "packages": [
+    "go_1_20"
+  ],
+  "shell": {
+    "init_hook": [
+      "chmod +x build.sh"
+    ],
+    "scripts": {
+      "build:dev": [
+        "./build.sh $@"
+      ],
+      "build:release": [
+        "./build.sh --version=$(cat version.txt) --release --image --push $@"
+      ]
+    }
+  },
+  "nixpkgs": {
+    "commit": "f80ac848e3d6f0c12c52758c0f25c10c97ca3b62"
+  }
+}
