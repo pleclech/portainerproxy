@@ -8,10 +8,10 @@
     ],
     "scripts": {
       "build:dev": [
-        "./build.sh $@"
+        "./build.sh --clean $@"
       ],
       "build:release": [
-        "./build.sh --version=$(cat version.txt) --release --image --push $@"
+        "./build.sh --version=$(cat version.txt) --clean --release --image --push $@"
       ]
     }
   },
