@@ -12,7 +12,10 @@
             "program": "${workspaceFolder}/main.go",
             "env": {
                 "CGO_ENABLED" : "0",
-            }
+            },
+            "args": [
+                "--debug",
+            ]
         }
     ]
 }
