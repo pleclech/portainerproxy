@@ -35,7 +35,7 @@ import (
 	"time"
 
 	"github.com/pleclech/portainerproxy/pkg/portainer"
-	log "github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 const (
@@ -66,15 +66,24 @@ func main() {
 		return
 	}
 
+	var logger *zap.Logger
+
 	// Enable debug mode if the debug flag is provided
 	if *debugFlag {
-		log.SetLevel(log.DebugLevel)
+		// set debug mode for zap
+		logger, _ = zap.NewDevelopment()
+		// log.SetLevel(log.DebugLevel)
+	} else {
+		logger, _ = zap.NewProduction()
 	}
+
+	defer logger.Sync()
 
 	// split address into host and port
 	host, port, err := net.SplitHostPort(*address)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal("Invalid address", zap.Error(err))
+		// log.Fatal(err)
 	}
 
 	// if host is empty, set it to localhost
@@ -84,9 +93,9 @@ func main() {
 
 	*address = host + ":" + port
 
-	proxy, err := portainer.NewProxy(*portainerURL, *dockerHost, *address, *portainerServiceName)
+	proxy, err := portainer.NewProxy(logger, *portainerURL, *dockerHost, *address, *portainerServiceName)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err.Error())
 	}
 
 	// Create an HTTP server
@@ -97,26 +106,28 @@ func main() {
 
 	// Start the HTTP/HTTPS server based on the flag
 	go func() {
-		log.Infof("Starting proxy server...")
-		log.Infof("Version: %s", version)
-		log.Infof("Portainer URL: %s", *portainerURL)
-		log.Infof("Docker host: %s", *dockerHost)
-		log.Infof("Debug mode: %v", *debugFlag)
+		logger.Info("Starting proxy server...",
+			zap.String("version", version),
+			zap.String("Portainer url", *portainerURL),
+			zap.String("Docker host", *dockerHost),
+			zap.Bool("debug", *debugFlag))
+
+		logger.Sync()
 
 		var err error
 		if *useHTTPS {
 			if *certFile == "" || *keyFile == "" {
-				log.Fatal("Both certificate file and key file paths must be provided for HTTPS mode")
+				logger.Fatal("Both certificate file and key file paths must be provided for HTTPS mode")
 			}
 
-			log.Infof("HTTPS proxy server listening on %v\n", *address)
+			logger.Info("HTTPS proxy server listening on", zap.String("address", *address))
 			err = server.ListenAndServeTLS(*certFile, *keyFile)
 		} else {
-			log.Infof("HTTP proxy server listening on %v", *address)
+			logger.Info("HTTP proxy server listening on", zap.String("address", *address))
 			err = server.ListenAndServe()
 		}
 		if err != nil && err != http.ErrServerClosed {
-			log.Fatal(err)
+			logger.Fatal(err.Error())
 		}
 	}()
 
@@ -132,9 +143,9 @@ func main() {
 
 	// Attempt to gracefully shut down the server
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Server shutdown error: %s", err)
+		logger.Fatal("Server shutdown error", zap.Error(err))
 	}
 
 	// and then shutdown the server
-	log.Infof("Shutting down the server...")
+	logger.Info("Shutting down the server...")
 }
