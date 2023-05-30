@@ -47,18 +47,24 @@ type actionConfig struct {
 	check     bool
 }
 
-func (a actionConfig) getContainerID(paths []string) string {
-	if a.tag == "containers" {
-		lPaths := len(paths)
-		if lPaths < 3 {
-			return ""
+func (a actionConfig) getID(paths []string) string {
+	lPaths := len(paths)
+
+	id := ""
+
+	switch a.tag {
+	case "containers", "exec":
+		if lPaths == 3 {
+			id = paths[lPaths-2]
+			break
 		}
-		if paths[lPaths-3] != "containers" {
-			return ""
+		if lPaths == 4 {
+			id = paths[lPaths-3]
+			break
 		}
-		return paths[lPaths-2]
 	}
-	return ""
+
+	return id
 }
 
 var actionConfigUpgrade = &actionConfig{
@@ -73,10 +79,28 @@ var actionConfigContainersUpgrade = &actionConfig{
 	check:     true,
 }
 
+var actionConfigContainersDirect = &actionConfig{
+	tag:       "containers",
+	proxyMode: proxyModeDockerDirect,
+	check:     true,
+}
+
 var actionConfigImageDirect = &actionConfig{
 	tag:       "images",
 	proxyMode: proxyModeDockerDirect,
 	check:     false,
+}
+
+var actionConfigExecUpgrade = &actionConfig{
+	tag:       "exec",
+	proxyMode: proxyModeDockerUpgrade,
+	check:     true,
+}
+
+var actionConfigExecDirect = &actionConfig{
+	tag:       "exec",
+	proxyMode: proxyModeDockerDirect,
+	check:     true,
 }
 
 var actionConfigProxy = &actionConfig{
@@ -85,41 +109,64 @@ var actionConfigProxy = &actionConfig{
 }
 
 var actionsConfig = map[string]*actionConfig{
-	"containers/exec":  actionConfigContainersUpgrade,
-	"containers/start": actionConfigContainersUpgrade,
-	"containers/wait":  actionConfigContainersUpgrade,
-	"images/create":    actionConfigUpgrade,
-	"grpc":             actionConfigUpgrade,
-	"session":          actionConfigUpgrade,
+	"containers/attach": actionConfigContainersUpgrade,
+	"containers/exec":   actionConfigContainersDirect,
+	"containers/start":  actionConfigContainersDirect,
+	"containers/wait":   actionConfigContainersDirect,
+	"exec/start":        actionConfigExecUpgrade,
+	"exec/resize":       actionConfigExecDirect,
+	"exec/json":         actionConfigExecDirect,
+	"images/create":     actionConfigUpgrade,
+	"grpc":              actionConfigUpgrade,
+	"session":           actionConfigUpgrade,
 }
 
-func getActionConfig(paths []string, isUpgradable bool) (string, *actionConfig) {
-	var key string
+func getActionConfig(paths []string, isUpgradable bool) (string, *actionConfig, []string) {
+	if len(paths) > 0 && paths[0] == "" {
+		paths = paths[1:]
+	}
 
-	lPaths := len(paths)
+	if len(paths) > 0 {
+		maybeQuery := paths[0]
+		if len(maybeQuery) >= 2 && maybeQuery[:2] == "--" {
+			paths = paths[1:]
+		}
+	}
 
-	if lPaths > 0 {
-		key = paths[lPaths-1]
-		if lPaths >= 2 {
-			if paths[lPaths-2] == "images" {
-				key = "images/" + key
-			} else {
-				if lPaths >= 3 && paths[lPaths-3] == "containers" {
-					key = "containers/" + key
-				}
+	if len(paths) > 0 {
+		maybeVersion := paths[0]
+		if len(maybeVersion) >= 2 && maybeVersion[0] == 'v' {
+			firstChar := byte(maybeVersion[1])
+			if firstChar >= '0' && firstChar <= '9' {
+				paths = paths[1:]
 			}
 		}
 	}
 
+	lPaths := len(paths)
+
+	var key string
+
+	if lPaths > 0 {
+		key = paths[lPaths-1]
+		if lPaths == 2 {
+			key = paths[lPaths-2] + "/" + key
+		} else if lPaths == 3 {
+			key = paths[lPaths-3] + "/" + key
+		} else if lPaths == 4 {
+			key = paths[lPaths-4] + "/" + key
+		}
+	}
+
 	if cfg, ok := actionsConfig[key]; ok {
-		return key, cfg
+		return key, cfg, paths
 	}
 
 	if isUpgradable {
-		return key, actionConfigUpgrade
+		return key, actionConfigUpgrade, paths
 	}
 
-	return key, actionConfigProxy
+	return key, actionConfigProxy, paths
 }
 
 // censor all but the  first and last characters
@@ -176,12 +223,7 @@ func (p PortainerEnv) NewRequest(cfg actionConfig, path string, req *http.Reques
 	*newReq = *req
 
 	switch cfg.proxyMode {
-	case proxyModeDockerDirect:
-		newReq.URL = &url.URL{
-			Scheme: "http",
-			Host:   "docker",
-		}
-	case proxyModeDockerUpgrade:
+	case proxyModeDockerDirect, proxyModeDockerUpgrade:
 		u, _ := url.Parse("http://docker/" + strings.TrimPrefix(path, "/"))
 		newReq.URL = u
 	default:
@@ -208,8 +250,7 @@ type PortainerInfo struct {
 }
 
 type PartialContainerInfo struct {
-	ID        string         `json:"Id"`
-	Portainer *PortainerInfo `json:"Portainer"`
+	ID string `json:"Id"`
 }
 
 func (p PortainerEnv) IsAllowed(cfg actionConfig, paths []string, connID int64, w http.ResponseWriter, r *http.Request) bool {
@@ -217,17 +258,17 @@ func (p PortainerEnv) IsAllowed(cfg actionConfig, paths []string, connID int64, 
 		return true
 	}
 
-	containerID := cfg.getContainerID(paths)
-	if containerID == "" {
+	id := cfg.getID(paths)
+	if id == "" {
 		return true
 	}
 
-	p.logger.Debug(fmt.Sprintf("connection#%d: checking for permission to access container %s", connID, containerID))
+	p.logger.Debug(fmt.Sprintf("connection#%d: checking access", connID), zap.String("id", id), zap.String("tag", cfg.tag))
 
 	// check if user is allowed to access this container
 	// from portainer api
 	// create request
-	req, err := http.NewRequest("GET", p.url.String()+"/api/endpoints/"+p.envID+"/docker/containers/"+containerID+"/json", nil)
+	req, err := http.NewRequest("GET", p.url.String()+"/api/endpoints/"+p.envID+"/docker/"+cfg.tag+"/"+id+"/json", nil)
 	if err != nil {
 		errS := fmt.Errorf("connection#%d: error creating request: %w", connID, err).Error()
 		p.logger.Debug(errS)
@@ -275,16 +316,14 @@ func (p PortainerEnv) IsAllowed(cfg actionConfig, paths []string, connID int64, 
 		return false
 	}
 
-	if containerInfo.Portainer == nil || containerInfo.Portainer.ResourceControl == nil {
+	if containerInfo.ID == "" {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
 	}
 
-	ok := containerInfo.Portainer.ResourceControl.ResourceID != ""
+	p.logger.Debug(fmt.Sprintf("connection#%d: permission to access container %s: %v", connID, id, true))
 
-	p.logger.Debug(fmt.Sprintf("connection#%d: permission to access container %s: %v", connID, containerID, ok))
-
-	return ok
+	return true
 }
 
 var ErrInvalidPortainerURL error
@@ -296,15 +335,31 @@ func (p *Proxy) NewPortainerEnv(connID int64, query string, serviceName string) 
 	p.logger.Debug(fmt.Sprintf("connection#%d: creating new portainer env", connID))
 
 	// parse query
-	queryMap, err := url.ParseQuery(query)
-	if err != nil {
-		return nil, err
+	var getKey func(string) string
+	if strings.HasPrefix(query, "{") && strings.HasSuffix(query, "}") {
+		// query is json
+		var queryMap map[string]string
+		err := json.Unmarshal([]byte(query), &queryMap)
+		if err != nil {
+			return nil, err
+		}
+		getKey = func(key string) string {
+			return queryMap[key]
+		}
+	} else {
+		queryMap, err := url.ParseQuery(query)
+		if err != nil {
+			return nil, err
+		}
+		getKey = func(key string) string {
+			return queryMap.Get(key)
+		}
 	}
 
 	portainerURL := p.portainerURL
 
 	// get url from queryMap
-	tmp := queryMap.Get("url")
+	tmp := getKey("url")
 	if tmp == "" {
 		if portainerURL == nil {
 			return nil, fmt.Errorf("url parameter is required in in docker host")
@@ -330,7 +385,7 @@ func (p *Proxy) NewPortainerEnv(connID int64, query string, serviceName string) 
 	}
 
 	// get user from queryMap
-	user := queryMap.Get("user")
+	user := getKey("user")
 	if user == "" && portainerURL.User != nil {
 		user = portainerURL.User.Username()
 	}
@@ -340,7 +395,7 @@ func (p *Proxy) NewPortainerEnv(connID int64, query string, serviceName string) 
 	}
 
 	// get apikey from queryMap
-	apikey := queryMap.Get("apikey")
+	apikey := getKey("apikey")
 	if apikey == "" && portainerURL.User != nil {
 		apikey, _ = portainerURL.User.Password()
 	}
@@ -349,7 +404,7 @@ func (p *Proxy) NewPortainerEnv(connID int64, query string, serviceName string) 
 	}
 
 	// get envid from queryMap
-	envid := queryMap.Get("envid")
+	envid := getKey("envid")
 	if envid == "" {
 		return nil, fmt.Errorf("envid parameter is required in in docker host")
 	}
@@ -423,7 +478,7 @@ func (l LogWriter) Write(p []byte) (n int, err error) {
 }
 
 func (p *Proxy) tryUpgrade(actionCfg actionConfig, w http.ResponseWriter, r *http.Request, connID int64) (bool, error) {
-	if actionCfg.proxyMode != proxyModeDockerUpgrade && actionCfg.proxyMode != proxyModeDockerDirect {
+	if actionCfg.proxyMode != proxyModeDockerUpgrade {
 		return false, nil
 	}
 
@@ -432,11 +487,16 @@ func (p *Proxy) tryUpgrade(actionCfg actionConfig, w http.ResponseWriter, r *htt
 		backendConn net.Conn
 	)
 
-	switch r.Header.Get("Upgrade") {
-	case "tcp", "h2c":
+	dialDocker := actionCfg.proxyMode == proxyModeDockerUpgrade
+	if !dialDocker {
+		upgrade := r.Header.Get("Upgrade")
+		dialDocker = upgrade == "tcp" || upgrade == "h2c"
+	}
+
+	if dialDocker {
 		p.logger.Debug(fmt.Sprintf("connection#%d: upgrading to TCP", connID))
 		backendConn, err = p.dial(r.Context())
-	default:
+	} else {
 		// fallback to tcp using host and port
 		p.logger.Debug(fmt.Sprintf("connection#%d: upgrading to TCP using adress: %s", connID, GetAddress(*r.URL)))
 		backendConn, err = net.Dial("tcp", GetAddress(*r.URL))
@@ -549,7 +609,18 @@ func ExtractQueryAndPath(requestURI string) (query string, path string) {
 		idx = strings.Index(requestURI, "--/")
 		if idx >= 0 {
 			path = query[idx-1:]
-			query = query[:idx-3]
+			query = strings.ReplaceAll(query[:idx-3], ",", "&")
+		}
+	} else {
+		idx = strings.Index(requestURI, "/{")
+		if idx >= 0 {
+			query = requestURI[idx+1:]
+
+			idx = strings.Index(requestURI, "}/")
+			if idx >= 0 {
+				path = query[idx+1:]
+				query = query[:idx]
+			}
 		}
 	}
 
@@ -569,14 +640,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	connID := p.incConnID()
 
-	query, qPath := ExtractQueryAndPath(r.RequestURI)
+	r.Header.Add("x-conn-id", fmt.Sprintf("%d", connID))
+	w.Header().Add("x-conn-id", fmt.Sprintf("%d", connID))
+
+	p.logger.Debug(fmt.Sprintf("connection#%d: requesting", connID), zap.String("requestURI", r.RequestURI), zap.String("method", r.Method), zap.String("remoteAddr", r.RemoteAddr), zap.String("userAgent", r.UserAgent()))
+
+	query, qPath := ExtractQueryAndPath(r.URL.Path)
+
+	paths := strings.Split(qPath, "/")
+
+	qURL := r.URL.Query().Encode()
+	if qURL != "" {
+		qPath += "?" + qURL
+	}
 
 	p.logger.Debug(fmt.Sprintf("connection#%d: relayed to %v", connID, qPath))
 
-	paths := strings.Split(r.URL.Path, "/")
-
 	isUpgrade := IsUpgradeRequest(r)
-	action, actionCfg := getActionConfig(paths, isUpgrade)
+	action, actionCfg, apiPaths := getActionConfig(paths, isUpgrade)
+
+	p.logger.Debug(fmt.Sprintf("connection#%d", connID), zap.String("action", action), zap.Any("apiPaths", apiPaths))
 
 	if isUpgrade {
 		p.logger.Debug(fmt.Sprintf("connection#%d: need upgrade (%s)", connID, action))
@@ -606,7 +689,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		r = pEnv.NewRequest(*actionCfg, qPath, r)
 
-		if !pEnv.IsAllowed(*actionCfg, paths, connID, w, r) {
+		if !pEnv.IsAllowed(*actionCfg, apiPaths, connID, w, r) {
 			return
 		}
 
@@ -633,7 +716,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if actionCfg.proxyMode == proxyModeDockerDirect {
-		proxyURL = r.URL
+		proxyURL = &url.URL{
+			Scheme: r.URL.Scheme,
+			Host:   GetAddress(*r.URL),
+		}
 		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 			p.logger.Debug(fmt.Sprintf("connection#%d: dialing docker", connID))
 			return p.dial(ctx)
@@ -644,6 +730,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy.Transport = transport
 
 	proxy.ServeHTTP(w, r)
+
+	p.logger.Debug(fmt.Sprintf("connection#%d: exited", connID))
 }
 
 func NewProxy(logger *zap.Logger, portainerURL, dockerHost string, listenAddr string, portainerServiceName string) (*Proxy, error) {
