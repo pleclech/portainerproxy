@@ -37,6 +37,11 @@ declare -l push="false"
 
 declare -l colored="true"
 
+declare -l clean="false"
+
+# List of target platforms
+declare -a platforms=("linux/amd64" "linux/arm64" "windows/amd64" "darwin/amd64")
+
 declare infoColor="\033[0;36m"
 declare errorColor="\033[0;31m"
 declare noColor="\033[0m"
@@ -109,7 +114,7 @@ getCurrentArch() {
 }
 
 showUsage() {
-    info "Usage: $0 [-r|--release] [-v version | --version=version] [-e executable-name | --executable=executable-name] [-b build-path | --build=build-path] [-i | --image build a docker image] [-p | --push push image to docker hub] [-u | --user user for docker hub]" >&2
+    info "Usage: $0 [-r|--release] [-v version | --version=version] [-e executable-name | --executable=executable-name] [-b build-path | --build=build-path] [-i | --image build a docker image] [-p | --push push image to docker hub] [-u | --user user for docker hub] [--clean] [--platforms=platform_1,..,platform_n]" >&2
     exit 1
 }
 
@@ -162,6 +167,15 @@ while getopts ":b:c:e:r:i:p:v:u:-:" opt; do
                 version=*)
                     version=${OPTARG#*=}
                     ;;
+                platforms=*)
+                    IFS=',' read -r -a platforms <<< "${OPTARG#*=}"
+                    ;;
+                clean)
+                    clean=true
+                    ;;
+                help)
+                    showUsage
+                    ;;
                 *)
                     error "Invalid option: --${OPTARG}" >&2
                     showUsage
@@ -175,9 +189,6 @@ while getopts ":b:c:e:r:i:p:v:u:-:" opt; do
     esac
 done
 
-# List of target platforms
-declare -a platforms=("linux/amd64" "linux/arm64" "windows/amd64" "darwin/amd64")
-
 # Create the output directory
 # capture the output of the mkdir command
 # and print it only if there is an error
@@ -187,51 +198,59 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-export CGO_ENABLED=0
+# If the clean flag is set, remove the output directory
+if [ "$clean" == "true" ]; then
+    info "Cleaning output directory: $outputDir"
+    rm -f "$outputDir"/*
+fi
 
+declare imagePrefix=""
+
+declare -a ldFlags=("-X main.version=$version")
+
+if [ "$release" == "true" ]; then
+    ldFlags+=("-s -w")
+else
+    imagePrefix="dev-"
+fi
+
+export CGO_ENABLED=0
 go mod tidy
 
-# Loop through the platforms and build only if release is true
-if [ "$release" == "true" ]; then
-    for platform in "${platforms[@]}"
-    do
-        # Extract the OS and architecture from the platform string
-        IFS='/' read -r -a platformArr <<< "$platform"
-        os="${platformArr[0]}"
-        arch="${platformArr[1]}"
+# Loop through the platforms and build them
+for platform in "${platforms[@]}"; do
+    # Extract the OS and architecture from the platform string
+    IFS='/' read -r -a platformArr <<< "$platform"
+    os="${platformArr[0]}"
+    arch="${platformArr[1]}"
 
-        # Set the environment variables
-        export GOOS="$os"
-        export GOARCH="$arch"
+    # Set the environment variables
+    export GOOS="$os"
+    export GOARCH="$arch"
 
-        # Define the output file name
-        outputFile="$outputDir/$executable-$os-$arch"
-        if [ $os = "windows" ]; then
-		    outputFile+='.exe'
-	    fi
+    # Define the output file name
+    outputFile="$outputDir/$executable-$os-$arch"
+    if [ $os = "windows" ]; then
+	    outputFile+='.exe'
+    fi
 
-        declare -a ldFlags=()
 
-        # Set the version
-        ldFlags+=("-X main.version=$version")
+    info "Building $outputFile version $version"
 
-        # remove debug information
-        ldFlags+=("-s -w")
+    # Build the executable
+    # capture the output of the build command
+    o=$(go build -o "$outputFile" -ldflags "${ldFlags[*]}" main.go)
+    if [ $? -ne 0 ]; then
+        error "$o"
+        exit 1
+    fi
+    info "$o"
 
-        info "Building $outputFile version $version"
+    # Print the build information
+    success "done"
+done
 
-        # Build the executable
-        # capture the output of the build command
-        o=$(go build -o "$outputFile" -ldflags "${ldFlags[*]}" main.go)
-        if [ $? -ne 0 ]; then
-            error "$o"
-            exit 1
-        fi
-
-        # Print the build information
-        success "done"
-    done
-else
+if [ "$release" != "true" ]; then
     outputFile="$outputDir/$executable"
 
     declare -a ldFlags=()
@@ -268,7 +287,7 @@ if [ "$image" == "true" ]; then
             continue
 	    fi
 
-        image="ghcr.io/${user}/portproxy:${version}-${os}-${arch}"
+        image="ghcr.io/${user}/${imagePrefix}portproxy:${version}-${os}-${arch}"
         
         info "Building image for ${image}"
         declare -a options=()
